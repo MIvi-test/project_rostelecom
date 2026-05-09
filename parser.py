@@ -22,7 +22,6 @@ def parse_file(file_path: str) -> List[Dict]:
                 })
         return file_structure
     except Exception as e:
-        print(f"Ошибка при парсинге {file_path}: {e}")
         return []
 
 def scan_directory(path: str = ".") -> Dict[str, List[Dict]]:
