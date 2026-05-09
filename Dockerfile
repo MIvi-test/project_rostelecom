@@ -16,7 +16,7 @@ RUN mkdir -p /data /code
 # Переменные окружения
 ENV DB_PATH=/data/code_index.db
 ENV INDEX_PATH=/code
-ENV REBUILD_INDEX=false
+ENV REBUILD_INDEX=true
 ENV PYTHONUNBUFFERED=1
 
 # Открываем порт

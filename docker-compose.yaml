@@ -14,7 +14,7 @@ services:
     environment:
       - DB_PATH=/data/code_index.db
       - INDEX_PATH=/code
-      - REBUILD_INDEX=${REBUILD_INDEX:-false}
+      - REBUILD_INDEX=${REBUILD_INDEX:-true}
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
 
