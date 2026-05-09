@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  code-archive:
+    build: .
+    container_name: code-archive
+    ports:
+      - "8000:8000"
+    volumes:
+      # Volume для постоянного хранения БД
+      - code-archive-data:/data
+      # Монтируем директорию с кодом для индексации
+      - ${CODE_PATH:-./code}:/code:ro
+    environment:
+      - DB_PATH=/data/code_index.db
+      - INDEX_PATH=/code
+      - REBUILD_INDEX=${REBUILD_INDEX:-false}
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+
+volumes:
+  code-archive-data:
+    name: code-archive-data
