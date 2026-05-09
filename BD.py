@@ -1,7 +1,9 @@
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+import re
 
 from sqlalchemy import (
+    Column,
     create_engine,
     Integer,
     String,
@@ -12,8 +14,9 @@ from sqlalchemy import (
     func,
     select,
     case,
+    Table,
+    MetaData,
     event,
-    text,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -27,10 +30,9 @@ from sqlalchemy.orm import (
 DB_PATH = "code_index.db"
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 
-# Включаем WAL-режим для параллельной работы (чтение во время записи)
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},
+    connect_args={"check_same_thread": False, "timeout": 30},
 )
 
 
@@ -79,46 +81,52 @@ class CodeElement(Base):
         Index("idx_ce_file_id", "file_id"),
         Index("idx_ce_name", "name"),
         Index("idx_ce_type", "element_type"),
-        Index(
-            "idx_ce_name_lower", func.lower("name")
-        ),  # запасной, если FTS не используется
+        Index("idx_ce_name_lower", func.lower(name)),
     )
 
 
+_fts_metadata = MetaData()
+code_elements_fts = Table(
+    "code_elements_fts",
+    _fts_metadata,
+    Column("rowid", Integer, primary_key=True),
+    Column("name", String),
+    Column("docstring", Text),
+)
+
+MAX_LIST_LIMIT = 1000
+MAX_SEARCH_LIMIT = 1000
+
+
 def init_db() -> None:
-    """Создаёт все таблицы, включая виртуальную FTS5."""
     Base.metadata.create_all(bind=engine)
-    # Создаём FTS5 таблицу, если её нет (выполняем сырой SQL)
+    setup_fts()
+
+
+def setup_fts() -> None:
     with engine.connect() as conn:
-        conn.execute(text("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS code_elements_fts USING fts5(
-                name,
-                docstring,
-                content='code_elements',
-                content_rowid='id'
-            );
-        """))
-        # Триггеры для автоматической синхронизации FTS с основной таблицей
-        conn.execute(text("""
-            CREATE TRIGGER IF NOT EXISTS ce_ai AFTER INSERT ON code_elements BEGIN
-                INSERT INTO code_elements_fts(rowid, name, docstring)
-                VALUES (new.id, new.name, new.docstring);
-            END;
-        """))
-        conn.execute(text("""
-            CREATE TRIGGER IF NOT EXISTS ce_ad AFTER DELETE ON code_elements BEGIN
-                INSERT INTO code_elements_fts(code_elements_fts, rowid, name, docstring)
-                VALUES ('delete', old.id, old.name, old.docstring);
-            END;
-        """))
-        conn.execute(text("""
-            CREATE TRIGGER IF NOT EXISTS ce_au AFTER UPDATE ON code_elements BEGIN
-                INSERT INTO code_elements_fts(code_elements_fts, rowid, name, docstring)
-                VALUES ('delete', old.id, old.name, old.docstring);
-                INSERT INTO code_elements_fts(rowid, name, docstring)
-                VALUES (new.id, new.name, new.docstring);
-            END;
-        """))
+        conn.exec_driver_sql(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS code_elements_fts USING fts5("
+            "    name, docstring, content='code_elements', content_rowid='id'"
+            ")"
+        )
+        conn.exec_driver_sql(
+            "CREATE TRIGGER IF NOT EXISTS ce_ai AFTER INSERT ON code_elements BEGIN "
+            "INSERT INTO code_elements_fts(rowid, name, docstring) "
+            "VALUES (new.id, new.name, new.docstring); END;"
+        )
+        conn.exec_driver_sql(
+            "CREATE TRIGGER IF NOT EXISTS ce_ad AFTER DELETE ON code_elements BEGIN "
+            "INSERT INTO code_elements_fts(code_elements_fts, rowid, name, docstring) "
+            "VALUES ('delete', old.id, old.name, old.docstring); END;"
+        )
+        conn.exec_driver_sql(
+            "CREATE TRIGGER IF NOT EXISTS ce_au AFTER UPDATE ON code_elements BEGIN "
+            "INSERT INTO code_elements_fts(code_elements_fts, rowid, name, docstring) "
+            "VALUES ('delete', old.id, old.name, old.docstring); "
+            "INSERT INTO code_elements_fts(rowid, name, docstring) "
+            "VALUES (new.id, new.name, new.docstring); END;"
+        )
         conn.commit()
 
 
@@ -130,59 +138,56 @@ def get_db():
         db.close()
 
 
+def sanitize_fts_query(keyword: str) -> str:
+    clean = re.sub(r"[^\w\s]", "", keyword)
+    clean = " ".join(clean.split())
+    if not clean:
+        return ""
+    escaped = clean.replace('"', '""')
+    return f'"{escaped}"*'
+
+
 def clear_all_data(db: Session) -> None:
-    """Полная очистка данных (включая FTS)."""
-    # Сначала чистим основную таблицу, триггеры обновят FTS
     db.query(CodeElement).delete()
     db.query(File).delete()
-    db.commit()
-    # Полная перестройка FTS-индекса для чистоты
-    db.execute(
-        text("INSERT INTO code_elements_fts(code_elements_fts) VALUES('rebuild')")
-    )
     db.commit()
 
 
 def save_file_elements(
     db: Session, file_path: str, elements: List[Dict[str, Any]]
 ) -> None:
-    """
-    Сохраняет структуру файла. При повторной индексации старые данные заменяются.
-    Используется пакетная вставка для производительности.
-    """
-    existing = db.query(File).filter(File.path == file_path).first()
-    if existing:
-        db.delete(existing)  # каскад удалит элементы, триггеры FTS очистят
-        db.flush()
+    try:
+        with db.begin_nested():
+            db.query(File).filter(File.path == file_path).delete()
+            file = File(path=file_path)
+            db.add(file)
+            db.flush()
 
-    file = File(path=file_path)
-    db.add(file)
-    db.flush()  # получаем file.id
-
-    if elements:
-        # Подготавливаем записи для пакетной вставки
-        mappings = [
-            {
-                "file_id": file.id,
-                "name": elem["name"],
-                "element_type": elem["element_type"],
-                "start_line": elem["start_line"],
-                "end_line": elem["end_line"],
-                "docstring": elem.get("docstring"),
-            }
-            for elem in elements
-        ]
-        # bulk_insert_mappings не поддерживает relationship, но у нас внешний ключ задан явно
-        db.execute(CodeElement.__table__.insert(), mappings)
-        # Триггеры AFTER INSERT заполнят FTS
-
-    db.commit()
+            if elements:
+                mappings = [
+                    {
+                        "file_id": file.id,
+                        "name": e["name"],
+                        "element_type": e["element_type"],
+                        "start_line": e["start_line"],
+                        "end_line": e["end_line"],
+                        "docstring": e.get("docstring"),
+                    }
+                    for e in elements
+                ]
+                db.bulk_insert_mappings(CodeElement.__mapper__, mappings)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
 
 def get_files_list(
-    db: Session, limit: Optional[int] = None, offset: Optional[int] = None
+    db: Session, limit: int = 100, offset: int = 0
 ) -> List[Dict[str, Any]]:
-    """Возвращает список файлов с количеством функций."""
+    if limit < 1 or limit > MAX_LIST_LIMIT:
+        limit = min(max(limit, 1), MAX_LIST_LIMIT)
+
     subq = (
         select(CodeElement.file_id, func.count(CodeElement.id).label("func_count"))
         .where(CodeElement.element_type == "function")
@@ -194,18 +199,15 @@ def get_files_list(
         select(File.path, func.coalesce(subq.c.func_count, 0).label("function_count"))
         .outerjoin(subq, File.id == subq.c.file_id)
         .order_by(File.path)
+        .limit(limit)
+        .offset(offset)
     )
-    if limit is not None:
-        stmt = stmt.limit(limit)
-    if offset is not None:
-        stmt = stmt.offset(offset)
 
     result = db.execute(stmt).all()
     return [{"path": row.path, "function_count": row.function_count} for row in result]
 
 
 def get_file_structure(db: Session, file_path: str) -> List[Dict[str, Any]]:
-    """Структура конкретного файла — элементы, отсортированные по строкам."""
     file = db.query(File).filter(File.path == file_path).first()
     if not file:
         return []
@@ -235,38 +237,25 @@ def search_elements(
     limit: Optional[int] = None,
     offset: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Полнотекстовый поиск по имени и docstring.
-    Используется FTS5, что даёт мгновенный поиск даже на 100k+ записях.
-    """
-    if not keyword:
+    fts_phrase = sanitize_fts_query(keyword)
+    if not fts_phrase:
         return []
 
-    # FTS5 ищет по словам; для подстроки "keyword*" используем префиксный поиск,
-    # но для имитации LIKE '%keyword%' обернём запрос в простой MATCH с двойными кавычками,
-    # что даёт точное совпадение фразы. Для приближения к старому поведению ищем слово,
-    # содержащее keyword: добавляем '*' в конце.
-    # Пример: keyword = "cache" -> "cache*"
-    fts_query = f'"{keyword}"*'  # фраза с префиксным завершением
+    safe_limit = limit if limit is not None else 100
+    safe_offset = offset if offset is not None else 0
+    safe_limit = min(max(safe_limit, 1), MAX_SEARCH_LIMIT)
 
-    # Основной запрос: соединяем FTS с code_elements и files
     stmt = (
         select(CodeElement, File.path)
         .join(File, CodeElement.file_id == File.id)
-        .join(
-            text("code_elements_fts ON code_elements.id = code_elements_fts.rowid"),
-        )
-        .where(func.code_elements_fts.code_elements_fts.match(fts_query))
+        .join(code_elements_fts, CodeElement.id == code_elements_fts.c.rowid)
+        .where(code_elements_fts.c.code_elements_fts.match(fts_phrase))
     )
 
     if element_type in ("function", "class"):
         stmt = stmt.where(CodeElement.element_type == element_type)
 
-    stmt = stmt.order_by(CodeElement.name)
-    if limit is not None:
-        stmt = stmt.limit(limit)
-    if offset is not None:
-        stmt = stmt.offset(offset)
+    stmt = stmt.order_by(CodeElement.name).limit(safe_limit).offset(safe_offset)
 
     result = db.execute(stmt).all()
 
@@ -284,9 +273,6 @@ def search_elements(
 
 
 def get_stats(db: Session) -> Dict[str, int]:
-    """
-    Один запрос на получение всей статистики вместо трёх.
-    """
     stmt = (
         select(
             func.count(File.id.distinct()).label("total_files"),
